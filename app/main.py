@@ -74,6 +74,18 @@ POST /v1/failure-count
   状态；被约简跳过的变量及到达终端后剩余的变量按各自先验计入；
   P(T)=0 或累计非终端节点超过 50000 时返回 422。
 
+POST /v1/first-failure-time
+  沿用 events、gates、top 的全部校验（事件限 1~8 个），另收 steps
+  （1~10 的整数）与覆盖全部事件 id 的 transitions，每项给出 fail、
+  recover 两个 n/d 概率（0<=n<=d<=10^6，规则同事件先验）。t=0 各
+  事件按 p 独立生成状态；此后每步给定上步状态后各事件独立转移：
+  正常事件以 fail 故障、故障事件以 recover 恢复；每步按共享事件
+  状态及 AND/OR/NOT 求顶事件。返回 first_hit_distribution：下标 t
+  对应顶事件首次在该步发生的概率（t=0~steps），以及全程未发生的
+  no_hit_probability，均为约分 n/d。仅对尚未触发顶事件的状态做
+  概率动态规划，触发即吸收、不再传播；transitions 缺项、出现
+  未知事件键或 fail/recover 非法时返回 422。
+
 所有错误输入（未知引用、跨版引用、环、非法概率、节点超限等）统一返回 422。
 """
 
@@ -90,6 +102,7 @@ from pydantic.config import ConfigDict
 
 from .bdd import MAX_NONTERMINAL_NODES, NodeLimitExceeded, ROBDD
 from .cutsets import compute_cut_set_families
+from .firsthit import first_hit_distribution
 from .likely import most_likely_assignment
 from .repair import best_repair
 
@@ -283,6 +296,40 @@ class FailureCountResponse(BaseModel):
         ...,
         description="下标 k 对应 P(K=k|T)：顶事件发生时全部已声明事件中"
         "恰有 k 个取 true 的条件概率，覆盖 k=0 到事件总数，约分 n/d",
+    )
+
+
+class TransitionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fail: str = Field(
+        ..., description="每步正常→故障的转移概率，n/d 形式，0<=n<=d<=10^6"
+    )
+    recover: str = Field(
+        ..., description="每步故障→正常的转移概率，n/d 形式，0<=n<=d<=10^6"
+    )
+
+
+class FirstFailureTimeRequest(AnalyzeRequest):
+    # 沿用 AnalyzeRequest 的 gates/top/extra 校验，仅收窄事件数上限
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[EventIn] = Field(..., min_length=1, max_length=8)
+    steps: StrictInt = Field(..., ge=1, le=10, description="观察步数：1~10 的整数")
+    transitions: Dict[str, TransitionIn] = Field(
+        ...,
+        description="覆盖全部事件 id 的逐步转移概率，每项含 fail 与 recover",
+    )
+
+
+class FirstFailureTimeResponse(BaseModel):
+    first_hit_distribution: List[str] = Field(
+        ...,
+        description="下标 t（0~steps）对应顶事件首次在第 t 步发生的概率，"
+        "约分 n/d；长度为 steps+1",
+    )
+    no_hit_probability: str = Field(
+        ..., description="steps 步内顶事件始终未发生的概率，约分 n/d"
     )
 
 
@@ -996,6 +1043,56 @@ def failure_count_logic(payload: AnalyzeRequest) -> FailureCountResponse:
     )
 
 
+def first_failure_time_logic(
+    payload: FirstFailureTimeRequest,
+) -> FirstFailureTimeResponse:
+    # events（本接口限 1~8 个）、gates、top 沿用 /v1/analyze 的全部校验
+    probs, gate_ops, gate_inputs = _validate_payload(payload)
+    sorted_events = sorted(probs)
+
+    # transitions 必须恰好覆盖全部事件 id：缺项与未知键多项问题一并返回
+    errors = _check_cover(payload.transitions, sorted_events, "transitions")
+    if errors:
+        raise ValueError("；".join(errors))
+
+    # fail / recover 均沿用事件先验的 n/d 概率规则；非法项逐项收集
+    fails: Dict[str, Fraction] = {}
+    recovers: Dict[str, Fraction] = {}
+    bad: List[str] = []
+    for eid in sorted_events:
+        transition = payload.transitions[eid]
+        try:
+            fails[eid] = _parse_probability(transition.fail)
+        except ValueError as exc:
+            bad.append(f"transitions[{eid!r}].fail：{exc}")
+        try:
+            recovers[eid] = _parse_probability(transition.recover)
+        except ValueError as exc:
+            bad.append(f"transitions[{eid!r}].recover：{exc}")
+    if bad:
+        raise ValueError("；".join(bad))
+
+    first_hit, no_hit = first_hit_distribution(
+        sorted_events,
+        [probs[eid] for eid in sorted_events],
+        gate_ops,
+        gate_inputs,
+        payload.top,
+        [fails[eid] for eid in sorted_events],
+        [recovers[eid] for eid in sorted_events],
+        payload.steps,
+    )
+
+    def frac_string(value: Fraction) -> str:
+        # 统一输出约分后的 n/d（整数时分母为 1）
+        return f"{value.numerator}/{value.denominator}"
+
+    return FirstFailureTimeResponse(
+        first_hit_distribution=[frac_string(v) for v in first_hit],
+        no_hit_probability=frac_string(no_hit),
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
@@ -1109,4 +1206,18 @@ async def failure_count(payload: AnalyzeRequest) -> FailureCountResponse:
         return _bad_request(str(exc))  # type: ignore[return-value]
     except ValueError as exc:
         # 未知引用、环、非法概率、top_probability=0 等全部语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post(
+    "/v1/first-failure-time", response_model=FirstFailureTimeResponse
+)
+async def first_failure_time(
+    payload: FirstFailureTimeRequest,
+) -> FirstFailureTimeResponse:
+    try:
+        return first_failure_time_logic(payload)
+    except ValueError as exc:
+        # 未知引用、环、非法概率，以及 transitions 缺项、多余键或
+        # fail/recover 非法等全部语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]
