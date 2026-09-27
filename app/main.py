@@ -74,6 +74,18 @@ POST /v1/failure-count
   状态；被约简跳过的变量及到达终端后剩余的变量按各自先验计入；
   P(T)=0 或累计非终端节点超过 50000 时返回 422。
 
+POST /v1/first-failure-time
+  events 限 1~8 个，gates、top 沿用 /v1/analyze 的全部校验；另收
+  steps（1~10 的转移步数）与 transitions（覆盖全部事件 id，每项
+  含 fail、recover 两个 n/d 概率）。t=0 各事件按自身 p 独立生成
+  初始状态；此后每步，正常（false）事件以 fail 故障，故障（true）
+  事件以 recover 恢复，给定上一步状态后各事件独立转移。每步按
+  共享事件状态及 AND/OR/NOT 求顶事件。返回 first_hit_distribution：
+  下标 t（0~steps）对应顶事件首次在第 t 步发生的概率，以及
+  no_hit_probability=全程未发生的概率，均为约分 n/d。仅对未触发
+  （顶事件尚未发生）状态做概率动态规划；steps/transitions 非法、
+  转移项缺失、多余或 fail/recover 非法概率时返回 422。
+
 所有错误输入（未知引用、跨版引用、环、非法概率、节点超限等）统一返回 422。
 """
 
@@ -90,6 +102,7 @@ from pydantic.config import ConfigDict
 
 from .bdd import MAX_NONTERMINAL_NODES, NodeLimitExceeded, ROBDD
 from .cutsets import compute_cut_set_families
+from .first_hit import first_failure_distribution, top_hit_masks
 from .likely import most_likely_assignment
 from .repair import best_repair
 
@@ -283,6 +296,41 @@ class FailureCountResponse(BaseModel):
         ...,
         description="下标 k 对应 P(K=k|T)：顶事件发生时全部已声明事件中"
         "恰有 k 个取 true 的条件概率，覆盖 k=0 到事件总数，约分 n/d",
+    )
+
+
+class TransitionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fail: str = Field(
+        ..., description="每步正常事件发生故障的概率，n/d 形式，0<=n<=d<=10^6"
+    )
+    recover: str = Field(
+        ..., description="每步故障事件恢复正常的概率，n/d 形式，0<=n<=d<=10^6"
+    )
+
+
+class FirstFailureTimeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[EventIn] = Field(..., min_length=1, max_length=8)
+    gates: List[GateIn] = Field(default_factory=list, max_length=64)
+    top: str = Field(..., min_length=1, description="顶层节点 id（事件或门）")
+    steps: StrictInt = Field(..., description="转移步数，取值 1~10 的整数")
+    transitions: Dict[str, TransitionIn] = Field(
+        ...,
+        description="覆盖全部事件 id 的转移参数：每项含 fail、recover 两个 n/d 概率",
+    )
+
+
+class FirstFailureTimeResponse(BaseModel):
+    first_hit_distribution: List[str] = Field(
+        ...,
+        description="下标 t（0~steps）对应顶事件首次在第 t 步发生的概率，"
+        "各项为约分 n/d",
+    )
+    no_hit_probability: str = Field(
+        ..., description="直到第 steps 步顶事件始终未发生的概率，约分 n/d"
     )
 
 
@@ -996,6 +1044,66 @@ def failure_count_logic(payload: AnalyzeRequest) -> FailureCountResponse:
     )
 
 
+def first_failure_time_logic(
+    payload: FirstFailureTimeRequest,
+) -> FirstFailureTimeResponse:
+    # events 限 1~8 个；gates/top 沿用 analyze 的全部静态校验
+    probs, gate_ops, gate_inputs = _validate_payload(payload)
+    sorted_events = sorted(probs)
+
+    # steps：1~10 的整数（类型错误如字符串、布尔、浮点由 pydantic 拦截）
+    if not 1 <= payload.steps <= 10:
+        raise ValueError(
+            f"steps 必须为 1~10 的整数，实际为 {payload.steps}"
+        )
+
+    # transitions 必须恰好覆盖全部事件 id：缺失项与多余项一并报错
+    cover_errors = _check_cover(payload.transitions, sorted_events, "transitions")
+    if cover_errors:
+        raise ValueError("；".join(cover_errors))
+
+    # fail/recover 沿用 n/d 概率原规则解析（0<=n<=d<=10^6）
+    fail_probs: Dict[str, Fraction] = {}
+    recover_probs: Dict[str, Fraction] = {}
+    bad: List[str] = []
+    for eid in sorted_events:
+        tr = payload.transitions[eid]
+        for field_name, target in (
+            ("fail", fail_probs),
+            ("recover", recover_probs),
+        ):
+            try:
+                target[eid] = _parse_probability(getattr(tr, field_name))
+            except ValueError as exc:
+                bad.append(f"事件 {eid!r} 的 transitions.{field_name}：{exc}")
+    if bad:
+        raise ValueError("；".join(bad))
+
+    # 顶事件 ROBDD（沿用 50000 非终端节点限额）；事件状态只有 2^n≤256 种，
+    # 枚举全部完整状态求出顶事件为真的状态集合，再交状态空间动态规划
+    _, bdd, top_node, _ = build_tree_robdd(
+        probs, gate_ops, gate_inputs, payload.top
+    )
+    hit_masks = top_hit_masks(bdd, top_node, len(sorted_events))
+
+    first_hit, no_hit = first_failure_distribution(
+        init_probs=[probs[eid] for eid in sorted_events],
+        fail_probs=[fail_probs[eid] for eid in sorted_events],
+        recover_probs=[recover_probs[eid] for eid in sorted_events],
+        hit_masks=hit_masks,
+        steps=payload.steps,
+    )
+
+    def frac_string(value: Fraction) -> str:
+        # 统一输出约分后的 n/d（整数时分母为 1）
+        return f"{value.numerator}/{value.denominator}"
+
+    return FirstFailureTimeResponse(
+        first_hit_distribution=[frac_string(v) for v in first_hit],
+        no_hit_probability=frac_string(no_hit),
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
@@ -1109,4 +1217,21 @@ async def failure_count(payload: AnalyzeRequest) -> FailureCountResponse:
         return _bad_request(str(exc))  # type: ignore[return-value]
     except ValueError as exc:
         # 未知引用、环、非法概率、top_probability=0 等全部语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post(
+    "/v1/first-failure-time", response_model=FirstFailureTimeResponse
+)
+async def first_failure_time(
+    payload: FirstFailureTimeRequest,
+) -> FirstFailureTimeResponse:
+    try:
+        return first_failure_time_logic(payload)
+    except NodeLimitExceeded as exc:
+        # 构建中累计非终端节点超过限制
+        return _bad_request(str(exc))  # type: ignore[return-value]
+    except ValueError as exc:
+        # 事件超限、steps 越界、transitions 缺项/多余、fail/recover
+        # 非法概率、未知引用、环等全部语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]

@@ -23,6 +23,11 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 以及失效数分布接口 `POST /v1/failure-count`：请求格式与 `/v1/analyze` 完全相同，令 `T` 为
 顶事件发生、`K` 为请求中**全部已声明事件**里取 `true` 的个数（包括未被顶层引用的事件；同一 id
 的重复引用只计一次），返回 `top_probability=P(T)` 与条件计数分布 `P(K=k|T)`（`k=0` 到事件总数）。
+还提供首次故障时间接口 `POST /v1/first-failure-time`：`events` 限 1～8 个，`gates`、`top` 校验
+同前，另收 `steps`（1～10）与覆盖全部事件 id 的 `transitions`（每项含 `fail`、`recover` 概率）。
+`t=0` 各事件按自身 `p` 独立生成状态，此后每步正常事件按 `fail` 故障、故障事件按 `recover` 恢复，
+给定上一步状态后各事件独立转移；返回顶事件**首次**在第 `t` 步（`t=0`～`steps`）发生的概率
+`first_hit_distribution` 与全程未发生的 `no_hit_probability`。
 
 ## 快速启动（Docker Compose）
 
@@ -41,6 +46,7 @@ docker compose up --build
 - 最可能成因接口：`http://localhost:8000/v1/likely-cause`
 - 改版对比接口：`http://localhost:8000/v1/compare-trees`
 - 失效数分布接口：`http://localhost:8000/v1/failure-count`
+- 首次故障时间接口：`http://localhost:8000/v1/first-failure-time`
 - 健康检查：`http://localhost:8000/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -570,6 +576,83 @@ curl -X POST http://localhost:8000/v1/failure-count \
 { "detail": "顶事件在结构上不可能发生：顶事件的 BDD 恒为假，top_probability=0，无法计算条件分布 P(K=k|T)" }
 ```
 
+## 首次故障时间请求示例（POST /v1/first-failure-time）
+
+在 `events` / `gates` / `top` 之外另收两个字段：
+
+- `steps`：转移步数，**1～10** 的整数；
+- `transitions`：**覆盖全部事件 id** 的映射，每项含两个 `n/d` 概率
+  （校验规则与事件的 `p` 相同：`0≤n≤d≤10^6`）：
+  - `fail`：每一步中，当前为正常（`false`）的事件发生故障（变 `true`）的概率；
+  - `recover`：每一步中，当前为故障（`true`）的事件恢复正常（变 `false`）的概率。
+
+时序模型：
+
+- `t=0`：各事件**相互独立**地按自身先验 `p` 生成初始状态（`true` 的概率为 `p`）；
+- 此后每一步，给定上一步的完整状态后，**各事件独立转移**——
+  正常事件以 `fail` 故障、以 `1−fail` 保持正常；故障事件以 `recover` 恢复、以 `1−recover` 保持故障；
+- 每一步都用当步的**共享事件状态**按 `AND` / `OR` / `NOT` 求一次顶事件。
+
+响应给出：
+
+- `first_hit_distribution`：长度为 `steps + 1` 的数组，**下标 `t` 对应顶事件首次在第 `t` 步发生的
+  概率**（即顶事件在 `0,…,t−1` 步均未发生而在第 `t` 步发生），覆盖 `t=0` 到 `t=steps`；
+- `no_hit_probability`：直到第 `steps` 步顶事件**始终未发生**的概率。
+  两者之和恒为 `1/1`，各项均为约分分数 `n/d`。
+
+下例中顶事件为 `a OR b`：两事件初始都确定正常（`p=0/1`），每步各以 `1/2` 独立故障、一旦故障
+不再恢复（`recover=0/1`），共模拟 3 步：
+
+```bash
+curl -X POST http://localhost:8000/v1/first-failure-time \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "a", "p": "0/1"},
+      {"id": "b", "p": "0/1"}
+    ],
+    "gates": [
+      {"id": "top", "op": "OR", "inputs": ["a", "b"]}
+    ],
+    "top": "top",
+    "steps": 3,
+    "transitions": {
+      "a": {"fail": "1/2", "recover": "0/1"},
+      "b": {"fail": "1/2", "recover": "0/1"}
+    }
+  }'
+```
+
+响应：
+
+```json
+{
+  "first_hit_distribution": ["0/1", "3/4", "3/16", "3/64"],
+  "no_hit_probability": "1/64"
+}
+```
+
+- `t=0` 两事件都确定正常，顶事件不可能发生：`0/1`。
+- 第 1 步至少一个事件故障的概率为 `1 − 1/2·1/2 = 3/4`；能不触发地走到第 2 步的状态只有
+  “两事件都正常”，其概率每步乘以 `1/4`，故首次发生在第 `t` 步（`t≥1`）的概率为
+  `(1/4)^(t-1) · 3/4`：`3/4`、`3/16`、`3/64`。
+- 3 步内始终只有“两事件都正常”一种未触发状态，其概率为 `(1/4)^3 = 1/64`，即
+  `no_hit_probability`；校验：`3/4 + 3/16 + 3/64 + 1/64 = 1`。
+- 动态规划**只保留未触发状态**的概率质量：每步顶事件发生的状态被当场吸收（计入当步
+  `first_hit` 后移出活跃分布），其后续演化不再参与计算；事件数不超过 8，活跃状态至多
+  `2^8 = 256` 个，全程整数公分母精确运算，输出时统一约分。
+- 同一事件被门多处引用时共享同一份状态；未被顶层引用的事件也照常按自身 `fail` / `recover`
+  演化（只是不影响顶事件取值）。
+- `fail`、`recover` 允许取 `0/1` 与 `1/1`：例如 `fail=1/1`、`recover=0/1` 表示正常事件下一步
+  必然故障且不可恢复。
+
+`transitions` 缺项、出现未知事件键（多余项）、或某项的 `fail` / `recover` 不是合法 `n/d`
+概率时返回 422，多项问题在同一条 `detail` 中一并说明：
+
+```json
+{ "detail": "transitions 缺少事件的对应项：'pump_fail'" }
+```
+
 ## 输入格式
 
 | 字段 | 规则 |
@@ -588,6 +671,9 @@ curl -X POST http://localhost:8000/v1/failure-count \
 | `observations`（仅 `/v1/likely-cause`） | 可选，**0～16** 个键值对（可为空或省略），格式同 `/v1/diagnose`；与顶事件发生一起构成条件 `C` |
 | `baseline` / `revised`（仅 `/v1/compare-trees`） | 必填，各含 `gates`（0～64 个，可省略）与 `top`；两版门 id 可同名但定义独立，不能跨版引用 |
 | 请求体（仅 `/v1/failure-count`） | 与 `/v1/analyze` 完全相同：仅 `events` / `gates` / `top`，校验规则一致 |
+| `events`（仅 `/v1/first-failure-time`） | **1～8** 个，`p` 规则同上；`gates`（0～64）与 `top` 沿用 `/v1/analyze` 全部校验 |
+| `steps`（仅 `/v1/first-failure-time`） | 必填，**1～10** 的整数转移步数 |
+| `transitions`（仅 `/v1/first-failure-time`） | 必填，键必须**恰好覆盖全部事件 id**；每项含 `fail`、`recover` 两个 `n/d` 概率（`0≤n≤d≤10^6`），分别为每步的故障概率与恢复概率 |
 
 概率在节点上按 `P(node) = (1-p_v)·P(low) + p_v·P(high)` 自底向上精确传播；
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
@@ -608,6 +694,12 @@ curl -X POST http://localhost:8000/v1/failure-count \
 低分支乘补概率不加计数，边上被约简跳过的变量与到达终端后剩余的变量按各自先验以
 `((1-p)+p·x)` 因子补入，根多项式的第 `k` 项即 `P(K=k 且 T)`，除以 `P(T)` 得条件分布，
 全程不枚举事件状态。
+`/v1/first-failure-time` 先在顶事件 ROBDD 上枚举全部 `2^n`（`n≤8`，至多 256 个）完整事件
+状态，标出顶事件为真的状态集合；再在该状态空间上做概率动态规划：`t=0` 按各事件先验之积
+生成状态质量，每一步按事件序逐个施加二态转移核（给定上步状态后各事件独立），把顶事件为真
+的状态质量当场吸收进当步 `first_hit` 并移出活跃分布——动态规划始终只在未触发状态上进行。
+全部质量以公分母下的整数传播（转移分母逐事件以最小公倍数并入，仅整数乘加），最终统一约分
+为 `n/d`，无浮点误差。
 
 ## 错误处理（HTTP 422）
 
@@ -637,11 +729,15 @@ curl -X POST http://localhost:8000/v1/failure-count \
 - `/v1/failure-count` 的 `top_probability = P(T) = 0`：顶事件在结构上不可能发生
   （BDD 恒为假），或结构可满足但先验下无正概率支持（如要求 `p=0` 的事件发生），
   响应说明具体原因；
+- `/v1/first-failure-time` 的 `steps` 不是 **1～10** 的整数（类型错误如字符串、布尔、
+  浮点同样拒绝）、`transitions` 缺少事件对应项或出现未知事件键（多项一并说明）、
+  某项的 `fail` / `recover` 不是合法 `n/d` 概率（规则同事件 `p`），或事件数超出 **8** 个；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
   （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`、
-  `/v1/likely-cause` 与 `/v1/failure-count`；其中 `/v1/diagnose`、
-  `/v1/inspect-next`、`/v1/likely-cause` 还含合取观测约束与候选分支新增的节点，
-  `/v1/failure-count` 的计数动态规划不新增 BDD 节点，限额仅针对故障树建图；
+  `/v1/likely-cause`、`/v1/failure-count` 与 `/v1/first-failure-time`；其中
+  `/v1/diagnose`、`/v1/inspect-next`、`/v1/likely-cause` 还含合取观测约束与候选分支
+  新增的节点，`/v1/failure-count` 的计数动态规划与 `/v1/first-failure-time` 的状态空间
+  动态规划均不新增 BDD 节点，限额仅针对故障树建图；
   `/v1/compare-trees` 为两版建图及差异运算的累计）。
 
 环示例响应：
@@ -669,11 +765,12 @@ python -m pytest -q
 ```
 app/
   __init__.py
-  bdd.py      # ROBDD：唯一表、ITE 算子、精确概率/重要度、联合证据加权与失效数计数分布
-  cutsets.py  # 最小割集：位掩码割集族、去重吸收、5000 组上限
-  repair.py   # 修复方案：ROBDD 上的受限赋值动态规划（成本/修复数/字典序）
-  likely.py   # 最可能成因：ROBDD 上的最大先验乘积赋值动态规划（false 优先）
-  main.py     # FastAPI 应用、请求模型与校验
+  bdd.py       # ROBDD：唯一表、ITE 算子、精确概率/重要度、联合证据加权与失效数计数分布
+  cutsets.py   # 最小割集：位掩码割集族、去重吸收、5000 组上限
+  repair.py    # 修复方案：ROBDD 上的受限赋值动态规划（成本/修复数/字典序）
+  likely.py    # 最可能成因：ROBDD 上的最大先验乘积赋值动态规划（false 优先）
+  first_hit.py # 首次故障时间：未触发状态上的整数公分母马尔可夫动态规划
+  main.py      # FastAPI 应用、请求模型与校验
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -685,4 +782,5 @@ tests/test_inspect_next.py
 tests/test_likely_cause.py
 tests/test_compare_trees.py
 tests/test_failure_count.py
+tests/test_first_failure_time.py
 ```
